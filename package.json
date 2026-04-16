@@ -1,0 +1,10 @@
+{
+  "name": "movie-ticket-detector",
+  "version": "1.0.0",
+  "description": "Event Cinemas ticket monitoring tool with web UI and Telegram notifications.",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js"
+  }
+}
