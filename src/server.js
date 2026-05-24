@@ -1,6 +1,7 @@
 ﻿const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { URL } = require("url");
 
 const PORT = Number(process.env.PORT || 3000);
@@ -13,6 +14,12 @@ const USER_AGENT =
 
 const TELEGRAM_DEFAULT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const TELEGRAM_DEFAULT_CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
+const ADMIN_TOKEN = String(process.env.ADMIN_TOKEN || "").trim();
+const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 120);
+const LOGIN_RATE_LIMIT_MAX = Number(process.env.LOGIN_RATE_LIMIT_MAX || 10);
+const AUTH_COOKIE_NAME = "movie_ticket_admin";
+const TRUST_PROXY = String(process.env.TRUST_PROXY || "").toLowerCase() === "true";
 
 const TARGET_CINEMAS = [
   {
@@ -38,6 +45,8 @@ let scheduleState = {
   timer: null,
   lastRunKey: ""
 };
+
+const rateLimitBuckets = new Map();
 
 function ensureStore() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -78,6 +87,210 @@ function readStore() {
 function writeStore(store) {
   ensureStore();
   fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2), "utf8");
+}
+
+function hashAdminToken(token, salt) {
+  return crypto
+    .createHash("sha256")
+    .update(`${salt}:${token}`)
+    .digest("hex");
+}
+
+function createAdminToken() {
+  return crypto.randomBytes(24).toString("base64url");
+}
+
+function ensureAdminCredentials() {
+  if (ADMIN_TOKEN) {
+    return;
+  }
+
+  const store = readStore();
+  if (store.settings.adminTokenHash && store.settings.adminTokenSalt) {
+    return;
+  }
+
+  const token = createAdminToken();
+  const salt = crypto.randomBytes(16).toString("hex");
+  store.settings.adminTokenHash = hashAdminToken(token, salt);
+  store.settings.adminTokenSalt = salt;
+  writeStore(store);
+
+  console.warn("Generated ADMIN_TOKEN for this instance:");
+  console.warn(token);
+  console.warn("Set ADMIN_TOKEN explicitly in production to avoid losing access if data is reset.");
+}
+
+function timingSafeEqualString(left, right) {
+  const leftBuffer = Buffer.from(String(left || ""));
+  const rightBuffer = Buffer.from(String(right || ""));
+  if (leftBuffer.length !== rightBuffer.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function verifyAdminToken(token) {
+  const candidate = String(token || "").trim();
+  if (!candidate) {
+    return false;
+  }
+
+  if (ADMIN_TOKEN) {
+    return timingSafeEqualString(candidate, ADMIN_TOKEN);
+  }
+
+  const store = readStore();
+  const salt = store.settings.adminTokenSalt;
+  const expectedHash = store.settings.adminTokenHash;
+  if (!salt || !expectedHash) {
+    return false;
+  }
+  return timingSafeEqualString(hashAdminToken(candidate, salt), expectedHash);
+}
+
+function parseCookies(req) {
+  const header = req.headers.cookie || "";
+  const cookies = {};
+  for (const part of header.split(";")) {
+    const index = part.indexOf("=");
+    if (index === -1) {
+      continue;
+    }
+    const key = part.slice(0, index).trim();
+    const value = part.slice(index + 1).trim();
+    cookies[key] = decodeURIComponent(value);
+  }
+  return cookies;
+}
+
+function getPresentedAdminToken(req) {
+  const auth = req.headers.authorization || "";
+  if (auth.toLowerCase().startsWith("bearer ")) {
+    return auth.slice(7).trim();
+  }
+
+  if (req.headers["x-admin-token"]) {
+    return String(req.headers["x-admin-token"]).trim();
+  }
+
+  return "";
+}
+
+function isAuthorized(req) {
+  return verifyAdminToken(getPresentedAdminToken(req)) || verifyAdminSession(req);
+}
+
+function getSessionSecret() {
+  if (ADMIN_TOKEN) {
+    return `env:${ADMIN_TOKEN}`;
+  }
+
+  const store = readStore();
+  return `store:${store.settings.adminTokenSalt || ""}:${store.settings.adminTokenHash || ""}`;
+}
+
+function createAdminSessionCookie() {
+  const createdAt = String(Date.now());
+  const signature = crypto
+    .createHmac("sha256", getSessionSecret())
+    .update(createdAt)
+    .digest("base64url");
+  return `${createdAt}.${signature}`;
+}
+
+function verifyAdminSession(req) {
+  const cookies = parseCookies(req);
+  const session = cookies[AUTH_COOKIE_NAME] || "";
+  const [createdAt, signature] = session.split(".");
+  const createdAtNumber = Number(createdAt);
+
+  if (!createdAt || !signature || !Number.isFinite(createdAtNumber)) {
+    return false;
+  }
+
+  const maxAgeMs = 12 * 60 * 60 * 1000;
+  if (Date.now() - createdAtNumber > maxAgeMs) {
+    return false;
+  }
+
+  const expected = crypto
+    .createHmac("sha256", getSessionSecret())
+    .update(createdAt)
+    .digest("base64url");
+
+  return timingSafeEqualString(signature, expected);
+}
+
+function getClientIp(req) {
+  if (TRUST_PROXY && req.headers["x-forwarded-for"]) {
+    return String(req.headers["x-forwarded-for"]).split(",")[0].trim();
+  }
+  return req.socket.remoteAddress || "unknown";
+}
+
+function checkRateLimit(key, maxRequests) {
+  const now = Date.now();
+  const bucket = rateLimitBuckets.get(key);
+  if (!bucket || now >= bucket.resetAt) {
+    rateLimitBuckets.set(key, {
+      count: 1,
+      resetAt: now + RATE_LIMIT_WINDOW_MS
+    });
+    return { allowed: true, remaining: Math.max(0, maxRequests - 1), retryAfter: 0 };
+  }
+
+  bucket.count += 1;
+  if (bucket.count > maxRequests) {
+    return {
+      allowed: false,
+      remaining: 0,
+      retryAfter: Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))
+    };
+  }
+
+  return {
+    allowed: true,
+    remaining: Math.max(0, maxRequests - bucket.count),
+    retryAfter: 0
+  };
+}
+
+function applyRateLimit(req, res, reqUrl) {
+  const ip = getClientIp(req);
+  const globalLimit = checkRateLimit(`global:${ip}`, RATE_LIMIT_MAX);
+  if (!globalLimit.allowed) {
+    sendRateLimitExceeded(res, globalLimit.retryAfter);
+    return false;
+  }
+
+  if (req.method === "POST" && reqUrl.pathname === "/login") {
+    const loginLimit = checkRateLimit(`login:${ip}`, LOGIN_RATE_LIMIT_MAX);
+    if (!loginLimit.allowed) {
+      sendRateLimitExceeded(res, loginLimit.retryAfter);
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function sendRateLimitExceeded(res, retryAfter) {
+  res.writeHead(429, {
+    "content-type": "text/plain; charset=utf-8",
+    "retry-after": String(retryAfter),
+    "cache-control": "no-store"
+  });
+  res.end("Too Many Requests");
+}
+
+function pruneRateLimitBuckets() {
+  const now = Date.now();
+  for (const [key, bucket] of rateLimitBuckets.entries()) {
+    if (now >= bucket.resetAt) {
+      rateLimitBuckets.delete(key);
+    }
+  }
 }
 
 function addLog(message, level = "info") {
@@ -698,6 +911,9 @@ function renderPage(data) {
     <section class="hero">
       <h1>Event Cinema 票务监测系统</h1>
       <p class="lead">按悉尼时区定时监测 <strong>IMAX Sydney</strong> 与 <strong>George Street</strong> 的影片开票情况。一旦你关注的影片出现可购场次，系统会通过 Telegram 立即通知。</p>
+      <form method="post" action="/logout" style="margin-top:16px">
+        <button class="secondary" type="submit">退出登录</button>
+      </form>
       ${flash}
       <div class="summary">
         <div class="stat">
@@ -776,6 +992,107 @@ function renderPage(data) {
 </html>`;
 }
 
+function renderLoginPage(data = {}) {
+  const flash = data.flash
+    ? `<div class="flash ${escapeHtml(data.flash.type || "info")}">${escapeHtml(data.flash.message || "")}</div>`
+    : "";
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>登录 - 电影票监测系统</title>
+  <style>
+    :root {
+      --bg: #eef2f6;
+      --panel: #ffffff;
+      --ink: #1f2933;
+      --accent: #2459a8;
+      --accent-dark: #183f78;
+      --line: #d6dee8;
+      --muted: #64748b;
+      --error: #9b1c1c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, #f8fafc 0%, var(--bg) 100%);
+      padding: 24px;
+    }
+    main {
+      width: min(420px, 100%);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 28px;
+      box-shadow: 0 18px 45px rgba(31, 41, 51, 0.08);
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 24px;
+    }
+    p {
+      margin: 0 0 22px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    label {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 8px;
+      color: var(--muted);
+    }
+    input {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      font: inherit;
+      margin-bottom: 16px;
+    }
+    button {
+      width: 100%;
+      border: 0;
+      border-radius: 8px;
+      padding: 12px 16px;
+      color: #fff;
+      background: var(--accent);
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:hover { background: var(--accent-dark); }
+    .flash {
+      margin-bottom: 16px;
+      border-radius: 8px;
+      padding: 12px 14px;
+      background: #fdecec;
+      color: var(--error);
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Admin Token</h1>
+    <p>访问电影票监测系统需要管理员令牌。</p>
+    ${flash}
+    <form method="post" action="/login">
+      <label for="adminToken">Admin Token</label>
+      <input id="adminToken" name="adminToken" type="password" autocomplete="current-password" required autofocus />
+      <button type="submit">登录</button>
+    </form>
+  </main>
+</body>
+</html>`;
+}
+
 function parseFormBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
@@ -814,6 +1131,69 @@ function getFlashFromUrl(reqUrl) {
 
 async function handleRequest(req, res) {
   const reqUrl = new URL(req.url, `http://${req.headers.host}`);
+
+  if (!applyRateLimit(req, res, reqUrl)) {
+    return;
+  }
+
+  if (req.method === "GET" && reqUrl.pathname === "/health") {
+    res.writeHead(200, {
+      "content-type": "text/plain; charset=utf-8",
+      "cache-control": "no-store"
+    });
+    res.end("ok");
+    return;
+  }
+
+  if (req.method === "GET" && reqUrl.pathname === "/login") {
+    if (isAuthorized(req)) {
+      return redirect(res, "/");
+    }
+    return sendHtml(
+      res,
+      renderLoginPage({
+        flash: getFlashFromUrl(reqUrl)
+      })
+    );
+  }
+
+  if (req.method === "POST" && reqUrl.pathname === "/login") {
+    const body = await parseFormBody(req);
+    if (!verifyAdminToken(body.adminToken)) {
+      return redirect(res, "/login?type=error&flash=Admin Token 无效");
+    }
+
+    res.writeHead(302, {
+      Location: "/",
+      "Set-Cookie": `${AUTH_COOKIE_NAME}=${encodeURIComponent(createAdminSessionCookie())}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200`,
+      "cache-control": "no-store"
+    });
+    res.end();
+    return;
+  }
+
+  if (!isAuthorized(req)) {
+    if (req.method === "GET" || req.method === "HEAD") {
+      return redirect(res, "/login");
+    }
+
+    res.writeHead(401, {
+      "content-type": "text/plain; charset=utf-8",
+      "cache-control": "no-store"
+    });
+    res.end("Unauthorized");
+    return;
+  }
+
+  if (req.method === "POST" && reqUrl.pathname === "/logout") {
+    res.writeHead(302, {
+      Location: "/login",
+      "Set-Cookie": `${AUTH_COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`,
+      "cache-control": "no-store"
+    });
+    res.end();
+    return;
+  }
 
   if (req.method === "GET" && reqUrl.pathname === "/") {
     const store = readStore();
@@ -920,7 +1300,9 @@ function startScheduler() {
 }
 
 ensureStore();
+ensureAdminCredentials();
 addLog("服务启动完成");
+setInterval(pruneRateLimitBuckets, RATE_LIMIT_WINDOW_MS).unref();
 startScheduler();
 
 const server = http.createServer((req, res) => {
