@@ -22,8 +22,11 @@ const AUTH_COOKIE_NAME = "movie_ticket_admin";
 const TRUST_PROXY = String(process.env.TRUST_PROXY || "").toLowerCase() === "true";
 
 const UPCOMING_DAYS = 31;
+const MAX_SELECTED_CINEMAS = 5;
+const EVENT_CINEMAS_ORIGIN = "https://www.eventcinemas.com.au";
+const CINEMA_LIST_URL = `${EVENT_CINEMAS_ORIGIN}/Cinemas`;
 
-const CINEMA_CATALOG = [
+const FALLBACK_CINEMA_CATALOG = [
   {
     key: "imax-sydney",
     name: "IMAX Sydney",
@@ -37,7 +40,7 @@ const CINEMA_CATALOG = [
     comingSoonUrl: "https://www.eventcinemas.com.au/Cinema/George-Street/ComingSoon"
   }
 ];
-const DEFAULT_CINEMA_KEYS = CINEMA_CATALOG.map((cinema) => cinema.key);
+const FALLBACK_CINEMA_KEYS = FALLBACK_CINEMA_CATALOG.map((cinema) => cinema.key);
 
 const SCHEDULE_RULES = [
   { weekday: "Tuesday", hour: 6, minute: 0 },
@@ -62,8 +65,10 @@ function ensureStore() {
       settings: {
         telegramBotToken: TELEGRAM_DEFAULT_TOKEN,
         telegramChatId: TELEGRAM_DEFAULT_CHAT_ID,
-        selectedCinemaKeys: DEFAULT_CINEMA_KEYS
+        selectedCinemaKeys: FALLBACK_CINEMA_KEYS
       },
+      cinemaCatalog: FALLBACK_CINEMA_CATALOG,
+      cinemaCatalogUpdatedAt: "",
       upcomingMovies: [],
       upcomingMoviesUpdatedAt: "",
       logs: [],
@@ -83,7 +88,12 @@ function readStore() {
   parsed.sentNotifications = parsed.sentNotifications || {};
   parsed.upcomingMovies = Array.isArray(parsed.upcomingMovies) ? parsed.upcomingMovies : [];
   parsed.upcomingMoviesUpdatedAt = parsed.upcomingMoviesUpdatedAt || "";
-  parsed.settings.selectedCinemaKeys = getValidCinemaKeys(parsed.settings.selectedCinemaKeys);
+  parsed.cinemaCatalog = getValidCinemaCatalog(parsed.cinemaCatalog);
+  parsed.cinemaCatalogUpdatedAt = parsed.cinemaCatalogUpdatedAt || "";
+  parsed.settings.selectedCinemaKeys = getValidCinemaKeys(
+    parsed.settings.selectedCinemaKeys,
+    parsed.cinemaCatalog
+  );
   if (!parsed.settings.telegramBotToken && TELEGRAM_DEFAULT_TOKEN) {
     parsed.settings.telegramBotToken = TELEGRAM_DEFAULT_TOKEN;
   }
@@ -325,19 +335,85 @@ function normalizeTitle(value) {
     .toLowerCase();
 }
 
-function getValidCinemaKeys(value) {
+function getDefaultCinemaKeys(catalog) {
+  const source = Array.isArray(catalog) && catalog.length > 0 ? catalog : FALLBACK_CINEMA_CATALOG;
+  return source.slice(0, Math.min(MAX_SELECTED_CINEMAS, source.length)).map((cinema) => cinema.key);
+}
+
+function normalizeCinemaPath(value) {
+  const path = String(value || "").trim().split("?")[0].replace(/\/+$/, "");
+  const match = path.match(/\/Cinema\/([^/?#]+)/i);
+  if (!match) {
+    return "";
+  }
+  return `/Cinema/${match[1]}`;
+}
+
+function buildCinemaFromPath(name, cinemaPath) {
+  const normalizedPath = normalizeCinemaPath(cinemaPath);
+  if (!name || !normalizedPath) {
+    return null;
+  }
+
+  const slug = normalizedPath.split("/").filter(Boolean).pop();
+  if (!slug) {
+    return null;
+  }
+
+  return {
+    key: slug.toLowerCase(),
+    name,
+    url: `${EVENT_CINEMAS_ORIGIN}${normalizedPath}`,
+    comingSoonUrl: `${EVENT_CINEMAS_ORIGIN}${normalizedPath}/ComingSoon`
+  };
+}
+
+function getValidCinemaCatalog(value) {
+  const incoming = Array.isArray(value) ? value : [];
+  const catalog = [];
+  const seen = new Set();
+
+  for (const item of incoming) {
+    if (!item) {
+      continue;
+    }
+
+    const name = String(item.name || "").trim();
+    const cinema = buildCinemaFromPath(name, String(item.url || "").replace(EVENT_CINEMAS_ORIGIN, ""));
+    if (!cinema || seen.has(cinema.key)) {
+      continue;
+    }
+
+    catalog.push({
+      ...cinema,
+      comingSoonUrl: item.comingSoonUrl || cinema.comingSoonUrl
+    });
+    seen.add(cinema.key);
+  }
+
+  return catalog.length > 0 ? catalog : FALLBACK_CINEMA_CATALOG;
+}
+
+function getCinemaCatalog(store) {
+  return getValidCinemaCatalog(store && store.cinemaCatalog);
+}
+
+function getValidCinemaKeys(value, catalog = FALLBACK_CINEMA_CATALOG) {
   const incoming = Array.isArray(value) ? value : [value].filter(Boolean);
-  const allowed = new Set(CINEMA_CATALOG.map((cinema) => cinema.key));
+  const validCatalog = getValidCinemaCatalog(catalog);
+  const allowed = new Set(validCatalog.map((cinema) => cinema.key));
   const selected = incoming
     .map((item) => String(item || "").trim())
     .filter((item) => allowed.has(item));
-  return selected.length > 0 ? Array.from(new Set(selected)) : DEFAULT_CINEMA_KEYS;
+  const unique = Array.from(new Set(selected)).slice(0, MAX_SELECTED_CINEMAS);
+  return unique.length > 0 ? unique : getDefaultCinemaKeys(validCatalog);
 }
 
 function getSelectedCinemas(store) {
-  const selectedKeys = getValidCinemaKeys(store.settings && store.settings.selectedCinemaKeys);
+  const catalog = getCinemaCatalog(store);
+  const selectedKeys = getValidCinemaKeys(store.settings && store.settings.selectedCinemaKeys, catalog);
   const selectedSet = new Set(selectedKeys);
-  return CINEMA_CATALOG.filter((cinema) => selectedSet.has(cinema.key));
+  return catalog.filter((cinema) => selectedSet.has(cinema.key));
 }
 
 function escapeHtml(value) {
@@ -360,6 +436,87 @@ function decodeHtmlEntities(value) {
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&#x2B;/g, "+");
+}
+
+function extractAttributes(tag) {
+  const attributes = {};
+  const pattern = /([a-zA-Z0-9_-]+)="([^"]*)"/g;
+  for (const match of tag.matchAll(pattern)) {
+    attributes[match[1].toLowerCase()] = decodeHtmlEntities(match[2]);
+  }
+  return attributes;
+}
+
+function extractCinemaCatalog(html) {
+  const catalog = [];
+  const seen = new Set();
+  const anchorPattern = /<a\b[^>]*data-name="[^"]+"[^>]*data-url="[^"]+"[^>]*>/gi;
+
+  for (const match of html.matchAll(anchorPattern)) {
+    const attributes = extractAttributes(match[0]);
+    const cinema = buildCinemaFromPath(attributes["data-name"], attributes["data-url"]);
+    if (!cinema || seen.has(cinema.key)) {
+      continue;
+    }
+
+    catalog.push(cinema);
+    seen.add(cinema.key);
+  }
+
+  return catalog.sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function isCinemaCatalogStale(store) {
+  if (!Array.isArray(store.cinemaCatalog) || store.cinemaCatalog.length <= FALLBACK_CINEMA_CATALOG.length) {
+    return true;
+  }
+
+  const updatedAt = Date.parse(store.cinemaCatalogUpdatedAt || "");
+  if (!Number.isFinite(updatedAt)) {
+    return true;
+  }
+
+  return Date.now() - updatedAt > 7 * 24 * 60 * 60 * 1000;
+}
+
+async function fetchCinemaCatalog() {
+  const response = await fetch(CINEMA_LIST_URL, {
+    headers: {
+      "user-agent": USER_AGENT,
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`影院列表请求失败: ${response.status}`);
+  }
+
+  const html = await response.text();
+  const catalog = extractCinemaCatalog(html);
+  if (catalog.length === 0) {
+    throw new Error("影院列表页面未解析到影院");
+  }
+  return catalog;
+}
+
+async function refreshCinemaCatalog(store = readStore(), options = {}) {
+  const shouldLog = options.log !== false;
+  const previousSelectedKeys = store.settings.selectedCinemaKeys;
+  const catalog = await fetchCinemaCatalog();
+  store.cinemaCatalog = catalog;
+  store.cinemaCatalogUpdatedAt = new Date().toISOString();
+  store.settings.selectedCinemaKeys = getValidCinemaKeys(previousSelectedKeys, catalog);
+  writeStore(store);
+
+  const message = `影院列表已刷新，共 ${catalog.length} 家，可选择最多 ${MAX_SELECTED_CINEMAS} 家`;
+  if (shouldLog) {
+    addLog(message);
+  }
+
+  return {
+    catalog,
+    message
+  };
 }
 
 function formatSydneyDate(date) {
@@ -893,6 +1050,7 @@ async function sendTelegramNotification(settings, match) {
 }
 
 function renderPage(data) {
+  const cinemaCatalog = getCinemaCatalog(data.store);
   const selectedCinemas = getSelectedCinemas(data.store);
   const selectedCinemaKeys = new Set(selectedCinemas.map((cinema) => cinema.key));
   const movieItems = data.store.movies
@@ -911,7 +1069,7 @@ function renderPage(data) {
     )
     .join("");
 
-  const cinemaItems = CINEMA_CATALOG.map(
+  const cinemaItems = cinemaCatalog.map(
     (cinema) => `
       <label class="checkbox-row">
         <input type="checkbox" name="cinemaKeys" value="${escapeHtml(cinema.key)}" ${
@@ -1226,11 +1384,19 @@ function renderPage(data) {
 
       <div class="panel">
         <h2>影院选择</h2>
-        <p class="hint">只会检测已勾选影院的开票状态，并按已选影院刷新即将上映影片。</p>
+        <p class="hint">从 Event Cinemas 影院列表中选择 1 到 ${MAX_SELECTED_CINEMAS} 家。只会检测已勾选影院的开票状态，并按已选影院刷新即将上映影片。</p>
         <form method="post" action="/cinemas">
           ${cinemaItems}
           <button type="submit">保存影院选择</button>
         </form>
+        <div class="inline-actions">
+          <form method="post" action="/cinemas/refresh">
+            <button class="secondary" type="submit">刷新影院列表</button>
+          </form>
+        </div>
+        <p class="hint">影院列表共 ${cinemaCatalog.length} 家；最近刷新：${
+          data.store.cinemaCatalogUpdatedAt ? escapeHtml(formatSydneyDate(new Date(data.store.cinemaCatalogUpdatedAt))) : "尚未刷新"
+        }</p>
         <div class="empty" style="margin-top:16px">
           <strong>固定调度</strong><br/>
           星期二 06:00<br/>
@@ -1514,6 +1680,13 @@ async function handleRequest(req, res) {
 
   if (req.method === "GET" && reqUrl.pathname === "/") {
     const store = readStore();
+    if (isCinemaCatalogStale(store)) {
+      try {
+        await refreshCinemaCatalog(store, { log: false });
+      } catch (error) {
+        addLog(`影院列表自动刷新失败: ${error.message}`, "warn");
+      }
+    }
     return sendHtml(
       res,
       renderPage({
@@ -1575,7 +1748,9 @@ async function handleRequest(req, res) {
     const submitted = Array.isArray(body.cinemaKeys)
       ? body.cinemaKeys
       : [body.cinemaKeys].filter(Boolean);
-    const allowed = new Set(CINEMA_CATALOG.map((cinema) => cinema.key));
+    const store = readStore();
+    const catalog = getCinemaCatalog(store);
+    const allowed = new Set(catalog.map((cinema) => cinema.key));
     const selectedCinemaKeys = Array.from(
       new Set(submitted.map((item) => String(item || "").trim()).filter((item) => allowed.has(item)))
     );
@@ -1584,11 +1759,20 @@ async function handleRequest(req, res) {
       return redirect(res, "/?type=error&flash=请至少选择一个影院");
     }
 
-    const store = readStore();
+    if (selectedCinemaKeys.length > MAX_SELECTED_CINEMAS) {
+      return redirect(res, `/?type=error&flash=最多只能选择 ${MAX_SELECTED_CINEMAS} 家影院`);
+    }
+
     store.settings.selectedCinemaKeys = selectedCinemaKeys;
     writeStore(store);
     addLog(`影院选择已更新: ${getSelectedCinemas(store).map((cinema) => cinema.name).join(", ")}`);
     return redirect(res, "/?type=success&flash=影院选择已保存");
+  }
+
+  if (req.method === "POST" && reqUrl.pathname === "/cinemas/refresh") {
+    const store = readStore();
+    const result = await refreshCinemaCatalog(store);
+    return redirect(res, `/?type=success&flash=${result.message}`);
   }
 
   if (req.method === "POST" && reqUrl.pathname === "/upcoming/refresh") {

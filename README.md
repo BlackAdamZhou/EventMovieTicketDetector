@@ -7,7 +7,7 @@ A lightweight Node.js application for monitoring ticket availability at selected
 ## Features
 
 - Web UI to add, view, and remove monitored movies
-- Web UI to choose which supported Event Cinemas locations to monitor
+- Web UI to refresh the Event Cinemas location list and choose 1 to 5 cinemas to monitor
 - Automatic refresh of movies coming soon within the next month for selected cinemas
 - Persistent storage for movie list and Telegram settings
 - Scheduled checks for selected cinemas in Sydney time
@@ -112,6 +112,7 @@ Protected endpoints:
 - `/movies`
 - `/movies/:id/delete`
 - `/cinemas`
+- `/cinemas/refresh`
 - `/upcoming/refresh`
 - `/settings`
 - `/check`
@@ -138,7 +139,7 @@ Results:
 
 1. Open `http://localhost:3000`
 2. Log in with the Admin Token
-3. Select the cinemas you want to monitor
+3. Refresh the cinema list if needed, then select 1 to 5 cinemas to monitor
 4. Refresh the coming-soon list to load movies within the next month
 5. Enter Telegram Bot Token and Chat ID in the UI
 6. Add the full movie title manually or from the coming-soon list
@@ -158,6 +159,7 @@ Checks run in Sydney time:
 - Docker data is stored in `/app/data/store.json`
 - When running with Docker, mount a volume to `/app/data` to preserve movie list and Telegram settings
 - Session data is fetched from Event Cinemas `/Cinemas/GetSessions`
+- Cinema locations are parsed from Event Cinemas `/Cinemas` and cached in `data/store.json`
 - Coming-soon movies are fetched from selected cinema `ComingSoon` pages and filtered to the next 31 days
 - The checker scans all available dates returned by the cinema API to avoid missing future sessions
 - Admin Token is configured by environment variable or persisted as a local hash; generated tokens are not stored in plaintext in pages, cookies, or data files
@@ -173,7 +175,7 @@ Checks run in Sydney time:
 ## 功能
 
 - Web UI 添加、查看、删除监测影片
-- Web UI 选择需要监测的 Event Cinemas 影院
+- Web UI 刷新 Event Cinemas 影院列表，并选择 1 到 5 家影院进行监测
 - 自动刷新已选影院未来 1 个月内即将上映的影片
 - 持久化保存监测列表与 Telegram 配置
 - 按悉尼时间定时检测已选影院
@@ -278,6 +280,7 @@ curl -H "Authorization: Bearer replace-with-a-strong-random-token" http://localh
 - `/movies`
 - `/movies/:id/delete`
 - `/cinemas`
+- `/cinemas/refresh`
 - `/upcoming/refresh`
 - `/settings`
 - `/check`
@@ -304,7 +307,7 @@ docker run -d --name movie-ticket-detector-test -p 3010:3000 -e ADMIN_TOKEN=repl
 
 1. 打开 `http://localhost:3000`
 2. 输入 Admin Token 登录
-3. 选择需要监测的影院
+3. 如有需要先刷新影院列表，然后选择 1 到 5 家需要监测的影院
 4. 刷新即将上映列表，获取未来 1 个月内的影片
 5. 在页面里填写 Telegram Bot Token 和 Chat ID
 6. 手动添加影片全名，或从即将上映列表一键加入监测
@@ -324,6 +327,7 @@ docker run -d --name movie-ticket-detector-test -p 3010:3000 -e ADMIN_TOKEN=repl
 - Docker 容器内的数据存储在 `/app/data/store.json`
 - 使用 Docker 运行时，建议挂载 volume 到 `/app/data`，避免容器删除后丢失监测列表和 Telegram 配置
 - 通过 Event Cinemas 的 `/Cinemas/GetSessions` 接口获取场次数据
+- 通过 Event Cinemas 的 `/Cinemas` 页面解析影院列表，并缓存到 `data/store.json`
 - 通过已选影院的 `ComingSoon` 页面获取即将上映影片，并过滤未来 31 天范围
 - 检测逻辑会遍历影院接口返回的全部可选日期，避免漏掉未来日期开售的影片
 - Admin Token 使用环境变量或本地哈希持久化，页面、cookie 和数据文件不会保存明文自动生成 token
