@@ -21,24 +21,27 @@ const LOGIN_RATE_LIMIT_MAX = Number(process.env.LOGIN_RATE_LIMIT_MAX || 10);
 const AUTH_COOKIE_NAME = "movie_ticket_admin";
 const TRUST_PROXY = String(process.env.TRUST_PROXY || "").toLowerCase() === "true";
 
-const TARGET_CINEMAS = [
+const UPCOMING_DAYS = 31;
+
+const CINEMA_CATALOG = [
   {
     key: "imax-sydney",
     name: "IMAX Sydney",
-    url: "https://www.eventcinemas.com.au/Cinema/IMAX-Sydney/NowShowing"
+    url: "https://www.eventcinemas.com.au/Cinema/IMAX-Sydney/NowShowing",
+    comingSoonUrl: "https://www.eventcinemas.com.au/Cinema/IMAX-Sydney/ComingSoon"
   },
   {
     key: "george-street",
     name: "George Street",
-    url: "https://www.eventcinemas.com.au/Cinema/George-Street/Sessions"
+    url: "https://www.eventcinemas.com.au/Cinema/George-Street/Sessions",
+    comingSoonUrl: "https://www.eventcinemas.com.au/Cinema/George-Street/ComingSoon"
   }
 ];
+const DEFAULT_CINEMA_KEYS = CINEMA_CATALOG.map((cinema) => cinema.key);
 
 const SCHEDULE_RULES = [
   { weekday: "Tuesday", hour: 6, minute: 0 },
-  { weekday: "Tuesday", hour: 23, minute: 0 },
-  { weekday: "Wednesday", hour: 7, minute: 0 },
-  { weekday: "Wednesday", hour: 23, minute: 0 }
+  { weekday: "Thursday", hour: 6, minute: 0 }
 ];
 
 let scheduleState = {
@@ -58,8 +61,11 @@ function ensureStore() {
       movies: [],
       settings: {
         telegramBotToken: TELEGRAM_DEFAULT_TOKEN,
-        telegramChatId: TELEGRAM_DEFAULT_CHAT_ID
+        telegramChatId: TELEGRAM_DEFAULT_CHAT_ID,
+        selectedCinemaKeys: DEFAULT_CINEMA_KEYS
       },
+      upcomingMovies: [],
+      upcomingMoviesUpdatedAt: "",
       logs: [],
       sentNotifications: {}
     };
@@ -75,6 +81,9 @@ function readStore() {
   parsed.settings = parsed.settings || {};
   parsed.logs = Array.isArray(parsed.logs) ? parsed.logs : [];
   parsed.sentNotifications = parsed.sentNotifications || {};
+  parsed.upcomingMovies = Array.isArray(parsed.upcomingMovies) ? parsed.upcomingMovies : [];
+  parsed.upcomingMoviesUpdatedAt = parsed.upcomingMoviesUpdatedAt || "";
+  parsed.settings.selectedCinemaKeys = getValidCinemaKeys(parsed.settings.selectedCinemaKeys);
   if (!parsed.settings.telegramBotToken && TELEGRAM_DEFAULT_TOKEN) {
     parsed.settings.telegramBotToken = TELEGRAM_DEFAULT_TOKEN;
   }
@@ -316,6 +325,21 @@ function normalizeTitle(value) {
     .toLowerCase();
 }
 
+function getValidCinemaKeys(value) {
+  const incoming = Array.isArray(value) ? value : [value].filter(Boolean);
+  const allowed = new Set(CINEMA_CATALOG.map((cinema) => cinema.key));
+  const selected = incoming
+    .map((item) => String(item || "").trim())
+    .filter((item) => allowed.has(item));
+  return selected.length > 0 ? Array.from(new Set(selected)) : DEFAULT_CINEMA_KEYS;
+}
+
+function getSelectedCinemas(store) {
+  const selectedKeys = getValidCinemaKeys(store.settings && store.settings.selectedCinemaKeys);
+  const selectedSet = new Set(selectedKeys);
+  return CINEMA_CATALOG.filter((cinema) => selectedSet.has(cinema.key));
+}
+
 function escapeHtml(value) {
   return String(value || "")
     .replace(/&/g, "&amp;")
@@ -330,6 +354,8 @@ function decodeHtmlEntities(value) {
     .replace(/&quot;/g, '"')
     .replace(/&#x27;/g, "'")
     .replace(/&#39;/g, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_, value) => String.fromCodePoint(Number.parseInt(value, 16)))
+    .replace(/&#(\d+);/g, (_, value) => String.fromCodePoint(Number.parseInt(value, 10)))
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
@@ -530,6 +556,169 @@ function extractCinemaId(html) {
   return Number(match[1]);
 }
 
+function extractComingSoonMovies(html) {
+  const patterns = [
+    /data-option=["']comingsoon["'][\s\S]*?data-movies="([^"]*)"/i,
+    /data-movies="([^"]*)"[\s\S]*?data-option=["']comingsoon["']/i,
+    /data-movies="([^"]*)"/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (!match) {
+      continue;
+    }
+
+    const raw = decodeHtmlEntities(match[1]);
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  }
+
+  return [];
+}
+
+function parseReleaseDate(value) {
+  if (!value) {
+    return null;
+  }
+
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function isWithinUpcomingWindow(value, now = new Date()) {
+  const releaseDate = parseReleaseDate(value);
+  if (!releaseDate) {
+    return false;
+  }
+
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(end.getDate() + UPCOMING_DAYS);
+  return releaseDate >= start && releaseDate <= end;
+}
+
+function formatDateOnly(value) {
+  const date = parseReleaseDate(value);
+  if (!date) {
+    return "";
+  }
+  return new Intl.DateTimeFormat("en-AU", {
+    timeZone: TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(date);
+}
+
+function getMovieUrl(movie) {
+  const url = movie.Url || movie.WebsiteUrl || movie.MovieUrl || "";
+  if (!url) {
+    return "";
+  }
+  return url.startsWith("http") ? url : `https://www.eventcinemas.com.au${url}`;
+}
+
+async function fetchCinemaComingSoonMovies(cinema) {
+  const pageResponse = await fetch(cinema.comingSoonUrl || cinema.url, {
+    headers: {
+      "user-agent": USER_AGENT,
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+  });
+
+  if (!pageResponse.ok) {
+    throw new Error(`${cinema.name} 即将上映页面请求失败: ${pageResponse.status}`);
+  }
+
+  const html = await pageResponse.text();
+  const movies = extractComingSoonMovies(html)
+    .filter((movie) => movie && movie.Name && isWithinUpcomingWindow(movie.ReleasedAt))
+    .map((movie) => ({
+      name: movie.Name,
+      releasedAt: movie.ReleasedAt || "",
+      movieUrl: getMovieUrl(movie),
+      cinemaKey: cinema.key,
+      cinemaName: cinema.name
+    }));
+
+  return {
+    cinema: cinema.name,
+    movies
+  };
+}
+
+function mergeUpcomingMovies(existing, incoming) {
+  const merged = new Map();
+
+  for (const movie of [...existing, ...incoming]) {
+    const key = normalizeTitle(movie.name);
+    if (!key) {
+      continue;
+    }
+
+    const current = merged.get(key) || {
+      id: createId(),
+      name: movie.name,
+      releasedAt: movie.releasedAt || "",
+      movieUrl: movie.movieUrl || "",
+      cinemas: [],
+      lastSeenAt: new Date().toISOString()
+    };
+
+    if (!current.releasedAt && movie.releasedAt) {
+      current.releasedAt = movie.releasedAt;
+    }
+    if (!current.movieUrl && movie.movieUrl) {
+      current.movieUrl = movie.movieUrl;
+    }
+    if (movie.cinemaName && !current.cinemas.includes(movie.cinemaName)) {
+      current.cinemas.push(movie.cinemaName);
+    }
+    current.lastSeenAt = new Date().toISOString();
+    merged.set(key, current);
+  }
+
+  return Array.from(merged.values()).sort((left, right) => {
+    const leftTime = parseReleaseDate(left.releasedAt)?.getTime() || Number.MAX_SAFE_INTEGER;
+    const rightTime = parseReleaseDate(right.releasedAt)?.getTime() || Number.MAX_SAFE_INTEGER;
+    return leftTime - rightTime || left.name.localeCompare(right.name);
+  });
+}
+
+async function refreshUpcomingMovies(store = readStore(), options = {}) {
+  const shouldLog = options.log !== false;
+  const selectedCinemas = getSelectedCinemas(store);
+  const found = [];
+  const errors = [];
+
+  for (const cinema of selectedCinemas) {
+    try {
+      const payload = await fetchCinemaComingSoonMovies(cinema);
+      found.push(...payload.movies);
+    } catch (error) {
+      errors.push(`${cinema.name}: ${error.message}`);
+    }
+  }
+
+  store.upcomingMovies = mergeUpcomingMovies([], found);
+  store.upcomingMoviesUpdatedAt = new Date().toISOString();
+  writeStore(store);
+
+  const message = `已刷新 ${UPCOMING_DAYS} 天内即将上映影片 ${store.upcomingMovies.length} 部`;
+  if (shouldLog) {
+    addLog(errors.length > 0 ? `${message}，异常 ${errors.length} 项` : message, errors.length > 0 ? "warn" : "info");
+    errors.forEach((item) => addLog(item, "error"));
+  }
+
+  return {
+    movies: store.upcomingMovies,
+    errors,
+    message
+  };
+}
+
 function pickAvailableSessions(movie, cinemaName) {
   const cinemaModels = Array.isArray(movie.CinemaModels) ? movie.CinemaModels : [];
   const matchedCinema = cinemaModels.find((item) => item && item.Name === cinemaName) || cinemaModels[0];
@@ -553,6 +742,16 @@ function buildNotificationKey(cinemaName, movieName, session) {
 
 async function runCheck(source = "manual") {
   const store = readStore();
+  const selectedCinemas = getSelectedCinemas(store);
+  const preflightErrors = [];
+
+  try {
+    const upcomingResult = await refreshUpcomingMovies(store, { log: false });
+    preflightErrors.push(...upcomingResult.errors);
+  } catch (error) {
+    preflightErrors.push(`刷新即将上映影片失败: ${error.message}`);
+  }
+
   const monitored = store.movies.map((movie) => ({
     ...movie,
     normalizedName: normalizeTitle(movie.name)
@@ -563,16 +762,21 @@ async function runCheck(source = "manual") {
       source,
       checkedAt: new Date().toISOString(),
       matches: [],
-      message: "监测列表为空，已跳过检测。"
+      errors: preflightErrors,
+      message: "监测列表为空，已跳过开票检测。"
     };
-    addLog(`[${source}] ${result.message}`, "warn");
+    addLog(
+      `[${source}] ${result.message}${preflightErrors.length > 0 ? `，异常 ${preflightErrors.length} 项` : ""}`,
+      preflightErrors.length > 0 ? "error" : "warn"
+    );
+    preflightErrors.forEach((item) => addLog(item, "error"));
     return result;
   }
 
   const allMatches = [];
-  const errors = [];
+  const errors = [...preflightErrors];
 
-  for (const cinema of TARGET_CINEMAS) {
+  for (const cinema of selectedCinemas) {
     try {
       const payload = await fetchCinemaMovies(cinema);
       for (const remoteMovie of payload.movies) {
@@ -689,6 +893,8 @@ async function sendTelegramNotification(settings, match) {
 }
 
 function renderPage(data) {
+  const selectedCinemas = getSelectedCinemas(data.store);
+  const selectedCinemaKeys = new Set(selectedCinemas.map((cinema) => cinema.key));
   const movieItems = data.store.movies
     .map(
       (movie) => `
@@ -699,6 +905,41 @@ function renderPage(data) {
           </div>
           <form method="post" action="/movies/${encodeURIComponent(movie.id)}/delete">
             <button class="danger" type="submit">移除</button>
+          </form>
+        </li>
+      `
+    )
+    .join("");
+
+  const cinemaItems = CINEMA_CATALOG.map(
+    (cinema) => `
+      <label class="checkbox-row">
+        <input type="checkbox" name="cinemaKeys" value="${escapeHtml(cinema.key)}" ${
+          selectedCinemaKeys.has(cinema.key) ? "checked" : ""
+        } />
+        <span>
+          <strong>${escapeHtml(cinema.name)}</strong>
+          <small>${escapeHtml(cinema.url)}</small>
+        </span>
+      </label>
+    `
+  ).join("");
+
+  const upcomingItems = data.store.upcomingMovies
+    .map(
+      (movie) => `
+        <li class="movie-item">
+          <div>
+            <strong>${escapeHtml(movie.name)}</strong>
+            <span class="meta">
+              上映日期 ${escapeHtml(formatDateOnly(movie.releasedAt) || "未知")}
+              ${movie.cinemas && movie.cinemas.length > 0 ? ` · ${escapeHtml(movie.cinemas.join(", "))}` : ""}
+            </span>
+            ${movie.movieUrl ? `<a class="link" href="${escapeHtml(movie.movieUrl)}" target="_blank" rel="noreferrer">查看影片页面</a>` : ""}
+          </div>
+          <form method="post" action="/movies">
+            <input type="hidden" name="movieName" value="${escapeHtml(movie.name)}" />
+            <button type="submit">添加监测</button>
           </form>
         </li>
       `
@@ -840,6 +1081,14 @@ function renderPage(data) {
     button.danger {
       background: #7a1f1f;
     }
+    input[type="checkbox"] {
+      width: auto;
+      margin: 0;
+      accent-color: var(--accent);
+    }
+    input[type="hidden"] {
+      display: none;
+    }
     .inline-actions {
       display: flex;
       gap: 10px;
@@ -868,6 +1117,30 @@ function renderPage(data) {
       margin-top: 6px;
       font-size: 12px;
       color: var(--muted);
+    }
+    .checkbox-row {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+      padding: 12px 14px;
+      margin-bottom: 10px;
+      color: var(--ink);
+    }
+    .checkbox-row small {
+      display: block;
+      color: var(--muted);
+      margin-top: 4px;
+      overflow-wrap: anywhere;
+    }
+    .link {
+      display: inline-block;
+      margin-top: 8px;
+      color: var(--accent-dark);
+      font-size: 13px;
+      font-weight: 600;
     }
     .log-item {
       display: grid;
@@ -910,7 +1183,7 @@ function renderPage(data) {
   <main class="wrap">
     <section class="hero">
       <h1>Event Cinema 票务监测系统</h1>
-      <p class="lead">按悉尼时区定时监测 <strong>IMAX Sydney</strong> 与 <strong>George Street</strong> 的影片开票情况。一旦你关注的影片出现可购场次，系统会通过 Telegram 立即通知。</p>
+      <p class="lead">按悉尼时区定时监测你选择的 Event Cinemas 影院。系统会自动刷新 1 个月内即将上映的影片；一旦你关注的影片出现可购场次，会通过 Telegram 立即通知。</p>
       <form method="post" action="/logout" style="margin-top:16px">
         <button class="secondary" type="submit">退出登录</button>
       </form>
@@ -921,8 +1194,8 @@ function renderPage(data) {
           <strong>${data.store.movies.length}</strong>
         </div>
         <div class="stat">
-          <span>目标影院</span>
-          <strong>${TARGET_CINEMAS.length}</strong>
+          <span>已选影院</span>
+          <strong>${selectedCinemas.length}</strong>
         </div>
         <div class="stat">
           <span>当前悉尼时间</span>
@@ -938,7 +1211,7 @@ function renderPage(data) {
     <section class="card-grid">
       <div class="panel">
         <h2>影片管理</h2>
-        <p class="hint">请输入影片全名。系统使用大小写不敏感的完整匹配进行监测。</p>
+        <p class="hint">请输入影片全名，或从下方“即将上映”列表一键加入。系统使用大小写不敏感的完整匹配进行监测。</p>
         <form method="post" action="/movies">
           <label for="movieName">影片名称</label>
           <input id="movieName" name="movieName" placeholder="例如：Mobile Suit Gundam: Hathaway" required />
@@ -952,7 +1225,40 @@ function renderPage(data) {
       </div>
 
       <div class="panel">
-        <h2>调度与通知</h2>
+        <h2>影院选择</h2>
+        <p class="hint">只会检测已勾选影院的开票状态，并按已选影院刷新即将上映影片。</p>
+        <form method="post" action="/cinemas">
+          ${cinemaItems}
+          <button type="submit">保存影院选择</button>
+        </form>
+        <div class="empty" style="margin-top:16px">
+          <strong>固定调度</strong><br/>
+          星期二 06:00<br/>
+          星期四 06:00<br/>
+          <span class="hint">以上均按 ${escapeHtml(TIME_ZONE)} 执行。</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="card-grid">
+      <div class="panel">
+        <h2>1 个月内即将上映</h2>
+        <p class="hint">列表来自已选影院的 Coming Soon 页面。部分影院页面如果未公开结构化列表，会在日志中记录但不会影响其他影院。</p>
+        <div class="inline-actions">
+          <form method="post" action="/upcoming/refresh">
+            <button class="secondary" type="submit">刷新即将上映影片</button>
+          </form>
+        </div>
+        <p class="hint">最近刷新：${data.store.upcomingMoviesUpdatedAt ? escapeHtml(formatSydneyDate(new Date(data.store.upcomingMoviesUpdatedAt))) : "尚未刷新"}</p>
+        ${
+          upcomingItems
+            ? `<ul class="movie-list">${upcomingItems}</ul>`
+            : `<div class="empty">当前还没有 1 个月内即将上映影片。可点击刷新获取最新列表。</div>`
+        }
+      </div>
+
+      <div class="panel">
+        <h2>通知配置</h2>
         <p class="hint">Telegram Chat ID 需要你自己的接收会话 ID。Bot Token 与 Chat ID 保存到本地 data/store.json。</p>
         <form method="post" action="/settings">
           <label for="telegramBotToken">Telegram Bot Token</label>
@@ -971,10 +1277,9 @@ function renderPage(data) {
           </form>
         </div>
         <div class="empty" style="margin-top:16px">
-          <strong>固定调度</strong><br/>
-          星期二 06:00 / 23:00<br/>
-          星期三 07:00 / 23:00<br/>
-          <span class="hint">以上均按 ${escapeHtml(TIME_ZONE)} 执行。</span>
+          <strong>立即检测会同时执行</strong><br/>
+          刷新 1 个月内即将上映影片<br/>
+          检查监测影片是否已有可售场次
         </div>
       </div>
     </section>
@@ -1104,7 +1409,19 @@ function parseFormBody(req) {
     });
     req.on("end", () => {
       const params = new URLSearchParams(body);
-      resolve(Object.fromEntries(params.entries()));
+      const parsed = {};
+      for (const [key, value] of params.entries()) {
+        if (Array.isArray(parsed[key])) {
+          parsed[key].push(value);
+          continue;
+        }
+        if (Object.prototype.hasOwnProperty.call(parsed, key)) {
+          parsed[key] = [parsed[key], value];
+          continue;
+        }
+        parsed[key] = value;
+      }
+      resolve(parsed);
     });
     req.on("error", reject);
   });
@@ -1251,6 +1568,34 @@ async function handleRequest(req, res) {
     writeStore(store);
     addLog("Telegram 配置已更新");
     return redirect(res, "/?type=success&flash=通知配置已保存");
+  }
+
+  if (req.method === "POST" && reqUrl.pathname === "/cinemas") {
+    const body = await parseFormBody(req);
+    const submitted = Array.isArray(body.cinemaKeys)
+      ? body.cinemaKeys
+      : [body.cinemaKeys].filter(Boolean);
+    const allowed = new Set(CINEMA_CATALOG.map((cinema) => cinema.key));
+    const selectedCinemaKeys = Array.from(
+      new Set(submitted.map((item) => String(item || "").trim()).filter((item) => allowed.has(item)))
+    );
+
+    if (selectedCinemaKeys.length === 0) {
+      return redirect(res, "/?type=error&flash=请至少选择一个影院");
+    }
+
+    const store = readStore();
+    store.settings.selectedCinemaKeys = selectedCinemaKeys;
+    writeStore(store);
+    addLog(`影院选择已更新: ${getSelectedCinemas(store).map((cinema) => cinema.name).join(", ")}`);
+    return redirect(res, "/?type=success&flash=影院选择已保存");
+  }
+
+  if (req.method === "POST" && reqUrl.pathname === "/upcoming/refresh") {
+    const store = readStore();
+    const result = await refreshUpcomingMovies(store);
+    const type = result.errors.length > 0 ? "warn" : "success";
+    return redirect(res, `/?type=${type}&flash=${result.message}`);
   }
 
   if (req.method === "POST" && reqUrl.pathname === "/check") {
